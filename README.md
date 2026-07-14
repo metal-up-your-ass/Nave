@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/assets/icon.png" alt="Nave icon" width="160"/></p>
+
 # Nave
 
 *Where the sound resonates — impulse-response cabinet simulation for guitar and bass DI.*

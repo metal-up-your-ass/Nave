@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/icon.png" alt="Nave icon" width="120"/></p>
+
 # Nave user manual
 
 *Cabinet impulse-response loader for guitar and bass reamping.*
