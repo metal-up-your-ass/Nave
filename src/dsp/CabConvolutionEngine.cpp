@@ -345,13 +345,26 @@ void CabConvolutionEngine::process (juce::dsp::AudioBlock<float>& block)
     // when Blend is actually engaged, saving the second convolution's CPU
     // cost otherwise - the same "skip work that provably can't matter"
     // pattern LoCut/HiCut/Distance use above.
+    //
+    // IR B must convolve the same original (dry) input as IR A, not IR A's
+    // already-convolved output - so the pre-convolution samples are copied
+    // into scratchBuffer *before* convolution.process() mutates `block` in
+    // place. Getting this ordering wrong would silently turn the "B"
+    // component of the crossfade into IR_B(IR_A(input)), a cascaded double
+    // convolution, instead of the intended IR_B(input).
+    if (blendEngaged)
+    {
+        juce::dsp::AudioBlock<float> scratchBlock (scratchBuffer);
+        auto scratchSub = scratchBlock.getSubBlock (0, numSamples);
+        scratchSub.copyFrom (block);
+    }
+
     convolution.process (context);
 
     if (blendEngaged)
     {
         juce::dsp::AudioBlock<float> scratchBlock (scratchBuffer);
         auto scratchSub = scratchBlock.getSubBlock (0, numSamples);
-        scratchSub.copyFrom (block);
 
         juce::dsp::ProcessContextReplacing<float> contextB (scratchSub);
         convolutionB.process (contextB);

@@ -4,6 +4,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cmath>
+#include <functional>
 
 namespace
 {
@@ -362,6 +363,127 @@ TEST_CASE ("IR Blend at 50% sits between IR A alone and IR B alone", "[dsp][engi
     REQUIRE (peakAtB < peakAtA);
     CHECK (peakAtHalf < peakAtA);
     CHECK (peakAtHalf > peakAtB);
+}
+
+TEST_CASE ("IR Blend with two distinct, non-identity IRs in both slots blends them in parallel, not in series",
+           "[dsp][engine][blend]")
+{
+    // Regression coverage for the plugin's headline IR Blend use case: two
+    // independently-captured, non-identity cab IRs (e.g. "a tight 4x12 with
+    // a boomier 2x12"), unlike every other blend test above, which leaves
+    // IR A at the default identity/delta IR and so cannot distinguish a
+    // correct parallel blend from an erroneous cascaded one (IR B applied
+    // on top of IR A's already-convolved output instead of the original dry
+    // input) - both slots below carry real, decaying, non-delta taps.
+    const auto makeIrA = []
+    {
+        juce::AudioBuffer<float> ir (1, 4);
+        ir.setSample (0, 0, 1.0f);
+        ir.setSample (0, 1, 0.6f);
+        ir.setSample (0, 2, 0.3f);
+        ir.setSample (0, 3, 0.1f);
+        return ir;
+    };
+
+    const auto makeIrB = []
+    {
+        juce::AudioBuffer<float> ir (1, 3);
+        ir.setSample (0, 0, 0.8f);
+        ir.setSample (0, 1, -0.4f);
+        ir.setSample (0, 2, 0.2f);
+        return ir;
+    };
+
+    // Ground truth for IR_A(input) and IR_B(input): each rendered by a
+    // *separate* engine with the candidate IR loaded into slot A only and
+    // Blend left at 0%, so process() never enters the blendEngaged branch at
+    // all. This is deliberate and load-bearing - if these references were
+    // instead captured via the dual-slot engine at Blend = 0%/100% (as the
+    // other blend tests above do), a cascaded implementation (IR B applied
+    // to IR A's already-convolved output) would still be perfectly linear in
+    // Blend once engaged, so an intermediate blend would match a linear
+    // interpolation of *those* (equally cascaded) references - silently
+    // passing despite the defect. Only comparing against references that
+    // never touch the blend branch actually exercises whether IR B receives
+    // the original dry input or IR A's output.
+    const auto renderIrAlone = [&] (const std::function<juce::AudioBuffer<float>()>& makeIr)
+    {
+        CabConvolutionEngine engine;
+        engine.setMixProportion (1.0f);
+        engine.setLevelDb (0.0f);
+        engine.setBlendProportion (0.0f);
+
+        const auto spec = makeTestSpec (2);
+        engine.prepare (spec);
+
+        engine.setImpulseResponse (makeIr(), testSampleRate);
+        engine.prepare (spec); // guarantee the async load is drained/active
+
+        juce::AudioBuffer<float> buffer (2, testBlockSize);
+        TestHelpers::fillWithSine (buffer, testSampleRate, testFrequencyHz, 0.5f);
+
+        juce::dsp::AudioBlock<float> block (buffer);
+        engine.process (block);
+
+        CHECK (TestHelpers::allSamplesFinite (buffer));
+        return buffer;
+    };
+
+    const auto renderBlended = [&] (float blendProportion)
+    {
+        CabConvolutionEngine engine;
+        engine.setMixProportion (1.0f);
+        engine.setLevelDb (0.0f);
+        engine.setBlendProportion (blendProportion);
+
+        const auto spec = makeTestSpec (2);
+        engine.prepare (spec);
+
+        engine.setImpulseResponse (makeIrA(), testSampleRate);
+        engine.setImpulseResponseB (makeIrB(), testSampleRate);
+        engine.prepare (spec); // guarantee both async loads are drained/active
+
+        juce::AudioBuffer<float> buffer (2, testBlockSize);
+        TestHelpers::fillWithSine (buffer, testSampleRate, testFrequencyHz, 0.5f);
+
+        juce::dsp::AudioBlock<float> block (buffer);
+        engine.process (block);
+
+        CHECK (TestHelpers::allSamplesFinite (buffer));
+        return buffer;
+    };
+
+    const auto pureA = renderIrAlone (makeIrA);
+    const auto pureB = renderIrAlone (makeIrB);
+    const auto blendedQuarter = renderBlended (0.25f);
+
+    // Sanity: the two references must actually differ, otherwise the check
+    // below would be vacuous.
+    REQUIRE (std::abs (TestHelpers::rms (pureA) - TestHelpers::rms (pureB)) > 1.0e-3);
+
+    constexpr float parallelBlendTolerance = 1.0e-4f;
+
+    for (int channel = 0; channel < blendedQuarter.getNumChannels(); ++channel)
+    {
+        const auto* aData = pureA.getReadPointer (channel);
+        const auto* bData = pureB.getReadPointer (channel);
+        const auto* mixedData = blendedQuarter.getReadPointer (channel);
+
+        float maxResidual = 0.0f;
+
+        for (int i = 0; i < testBlockSize; ++i)
+        {
+            // The correct, parallel crossfade: (1 - blend) * IR_A(input) +
+            // blend * IR_B(input). A cascaded implementation (IR B applied
+            // to IR A's output) would diverge from this by far more than
+            // floating-point noise, since both IRs here are genuinely
+            // different, non-identity filters.
+            const auto expected = 0.75f * aData[i] + 0.25f * bData[i];
+            maxResidual = std::max (maxResidual, std::abs (mixedData[i] - expected));
+        }
+
+        CHECK (maxResidual < parallelBlendTolerance);
+    }
 }
 
 TEST_CASE ("Distance at 0% (default) is a bit-exact passthrough", "[dsp][engine][distance]")
