@@ -104,14 +104,19 @@ public:
     // (Convolution takes ownership to avoid an audio-thread copy). Also
     // records this IR's onset sample/rate as the reference that a
     // subsequently loaded IR B is phase-aligned against (see
-    // setImpulseResponseB()).
+    // setImpulseResponseB()). If a real (non-default) IR B is already
+    // loaded, its alignment is re-run against this new reference before
+    // returning, so a later A reload never leaves IR B silently aligned to a
+    // stale onset (see #13).
     void setImpulseResponse (juce::AudioBuffer<float> irBuffer, double irSampleRate);
 
     // Resets slot A to the default unit-impulse (delta) IR - a mathematical
     // passthrough. Used both for the plugin's out-of-the-box default and to
     // let the user explicitly clear a loaded IR. Same off-audio-thread
     // contract as setImpulseResponse(). Also resets the phase-alignment
-    // reference back to the delta IR's trivial (sample 0) onset.
+    // reference back to the delta IR's trivial (sample 0) onset, and
+    // (like setImpulseResponse() above) re-aligns an already-loaded IR B
+    // against it (see #13).
     void loadDefaultImpulseResponse();
 
     // Loads a new impulse response into slot B (the secondary IR used for IR
@@ -119,11 +124,15 @@ public:
     // loading, `irBuffer` is time-shifted ("inter-IR phase alignment", see
     // IrAlignment.h) so its detected onset lines up with slot A's most
     // recently recorded onset - this prevents comb-filtering when Blend
-    // crossfades the two convolution outputs together.
+    // crossfades the two convolution outputs together. A copy of the raw,
+    // pre-alignment buffer is retained so a later IR A reload can re-run
+    // this alignment automatically (see setImpulseResponse() and #13).
     void setImpulseResponseB (juce::AudioBuffer<float> irBuffer, double irSampleRate);
 
     // Resets slot B to the default unit-impulse (delta) IR. Same
-    // off-audio-thread contract as loadDefaultImpulseResponse().
+    // off-audio-thread contract as loadDefaultImpulseResponse(). Also clears
+    // the retained raw-IR-B/alignment bookkeeping above, since the default
+    // delta IR is never re-aligned on a subsequent IR A reload.
     void loadDefaultImpulseResponseB();
 
     // Convolution engine latency in samples, valid after prepare() has run.
@@ -216,11 +225,19 @@ private:
     bool anyImpulseResponseBLoaded = false;
 
     // Previous block's engaged (i.e. not bypassed) state for LoCut/HiCut/
-    // Distance, used to detect bypassed->engaged transitions so the
-    // filter(s) can be reset to a clean state exactly then (see process()).
+    // Distance/Blend, used to detect bypassed->engaged transitions so the
+    // filter(s)/convolution engine can be reset to a clean state exactly
+    // then (see process()). Blend's counterpart is convolutionB: unlike
+    // LoCut/HiCut/Distance's IIR filters, convolutionB is a stateful
+    // juce::dsp::Convolution whose internal overlap-add buffer keeps
+    // accumulating output for future blocks even after the engine stops
+    // calling its process() (see the Blend disengaged-branch below) - left
+    // unreset, that stale, time-decoupled tail gets added back into the
+    // output on re-engagement (see #12).
     bool loCutEngagedPreviously = false;
     bool hiCutEngagedPreviously = false;
     bool distanceEngagedPreviously = false;
+    bool blendEngagedPreviously = false;
 
     // IR A's most recently loaded onset sample/rate, recorded by
     // setImpulseResponse()/loadDefaultImpulseResponse() and used as the
@@ -228,6 +245,18 @@ private:
     // IrAlignment.h).
     int lastIrAOnsetSample = 0;
     double lastIrASampleRate = 44100.0;
+
+    // A copy of IR B's raw, pre-alignment buffer/sample rate, retained so
+    // that a later reload of IR A (which changes the alignment reference
+    // above) can re-run alignment for the *already-loaded* IR B without
+    // requiring the caller to reload it - see setImpulseResponse()/
+    // loadDefaultImpulseResponse() and #13. irBNeedsAlignment is true once a
+    // real (non-default) IR B has been loaded via setImpulseResponseB();
+    // loadDefaultImpulseResponseB() clears it, since the default delta IR
+    // has no meaningful onset to keep aligned.
+    juce::AudioBuffer<float> lastIrBRawBuffer;
+    double lastIrBRawSampleRate = 44100.0;
+    bool irBNeedsAlignment = false;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CabConvolutionEngine)
 };

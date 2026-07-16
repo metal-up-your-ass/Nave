@@ -486,6 +486,163 @@ TEST_CASE ("IR Blend with two distinct, non-identity IRs in both slots blends th
     }
 }
 
+TEST_CASE ("convolutionB is reset on Blend's disengaged->engaged transition, not left carrying a stale overlap tail",
+           "[dsp][engine][blend]")
+{
+    // Regression coverage for #12. juce::dsp::Convolution's zero-latency
+    // uniformly-partitioned algorithm carries an internal overlap-add tail
+    // ("bufferOverlap"/"overlapData" in JUCE 8.0.14's juce_Convolution.cpp)
+    // that is only ever mutated inside processSamples() - process() below
+    // skips convolutionB.process() entirely for every block Blend is
+    // disengaged, so that tail is frozen (not decaying) for as long as
+    // Blend stays disengaged.
+    //
+    // Each block here is a single full-size (testBlockSize) call rather than
+    // many small ones deliberately: testBlockSize's duration (~170 ms at
+    // 48 kHz) comfortably exceeds the engine's internal parameter-smoothing
+    // ramp (50 ms, see CabConvolutionEngine::smoothingTimeSeconds), so
+    // blendSmoothed.skip() settles fully to its new target *within* the very
+    // next block - Blend's disengaged/engaged state is then clean and
+    // block-atomic, with no partially-ramped blocks in between to muddy
+    // which state was actually in effect when.
+    constexpr int irLength = 512; // several times shorter than testBlockSize,
+                                   // so its full ring-down tail fits inside
+                                   // one process() call's overlap-add state
+
+    CabConvolutionEngine engine;
+    engine.setMixProportion (1.0f);
+    engine.setLevelDb (0.0f);
+    engine.setBlendProportion (1.0f); // engaged from the start
+
+    const auto spec = makeTestSpec (2);
+    engine.prepare (spec);
+
+    // A long, high-energy, slowly-decaying IR B, so any leaked overlap tail
+    // is unmistakable rather than lost in floating-point noise.
+    juce::AudioBuffer<float> irB (1, irLength);
+    for (int i = 0; i < irLength; ++i)
+        irB.setSample (0, i, 0.8f * std::pow (0.995f, static_cast<float> (i)));
+
+    engine.setImpulseResponseB (std::move (irB), testSampleRate);
+    engine.prepare (spec); // guarantee the async load is drained/active
+
+    juce::AudioBuffer<float> buffer (2, testBlockSize);
+
+    // One loud, engaged block: builds real, non-trivial state in
+    // convolutionB's internal overlap-add buffer (its ring-down tail
+    // extends past this block's end, into what would be the next call).
+    TestHelpers::fillWithSine (buffer, testSampleRate, testFrequencyHz, 0.9f);
+    juce::dsp::AudioBlock<float> engagedBlock (buffer);
+    engine.process (engagedBlock);
+    CHECK (TestHelpers::allSamplesFinite (buffer));
+
+    // Disengage Blend for one full block. convolutionB.process() is skipped
+    // entirely for it, so its internal state - including that ring-down
+    // tail - is frozen exactly where the block above left it, not decayed.
+    engine.setBlendProportion (0.0f);
+    buffer.clear();
+    juce::dsp::AudioBlock<float> disengagedBlock (buffer);
+    engine.process (disengagedBlock);
+
+    // Re-engage Blend and feed pure silence. With convolutionB correctly
+    // reset on the disengaged->engaged transition, silence in must produce
+    // silence out. Without the reset (the bug), the frozen overlap-add tail
+    // from the loud block above gets added back into this block's output.
+    engine.setBlendProportion (1.0f);
+    buffer.clear();
+
+    juce::dsp::AudioBlock<float> reengagedBlock (buffer);
+    engine.process (reengagedBlock);
+
+    CHECK (TestHelpers::allSamplesFinite (buffer));
+    CHECK (TestHelpers::peakAbsolute (buffer) < nullTestTolerance);
+}
+
+TEST_CASE ("Reloading IR A after IR B re-aligns IR B against the new reference, not the stale one",
+           "[dsp][engine][blend][ir-alignment]")
+{
+    // Regression coverage for #13. setImpulseResponseB() aligns IR B
+    // against whatever IR A onset is current *at the moment it's called*;
+    // reloading IR A afterwards must re-run that alignment against the new
+    // reference, or IR B silently stays aligned to the stale, overwritten
+    // onset. Compares an engine that reloads IR A after IR B (the buggy
+    // sequence) against a reference engine that loads IR A with the same
+    // final onset *before* IR B is ever loaded (so IR B's alignment there
+    // is, by construction, never stale) - a correct implementation must
+    // make both produce the same IR-B-driven output.
+    constexpr int totalSamples = 96;
+
+    const auto makeTransientAt = [] (int onsetSample)
+    {
+        juce::AudioBuffer<float> buffer (1, totalSamples);
+        buffer.clear();
+
+        for (int i = onsetSample; i < totalSamples; ++i)
+            buffer.setSample (0, i, std::pow (0.7f, static_cast<float> (i - onsetSample)));
+
+        return buffer;
+    };
+
+    const auto renderIrBOnly = [&] (const std::function<void (CabConvolutionEngine&, const juce::dsp::ProcessSpec&)>& loadSequence)
+    {
+        CabConvolutionEngine engine;
+        engine.setMixProportion (1.0f);
+        engine.setLevelDb (0.0f);
+        engine.setBlendProportion (1.0f); // IR B only, so IR A's final content is irrelevant to the output
+
+        const auto spec = makeTestSpec (2);
+        engine.prepare (spec);
+
+        loadSequence (engine, spec);
+
+        juce::AudioBuffer<float> impulse (2, totalSamples);
+        impulse.clear();
+        impulse.setSample (0, 0, 1.0f);
+        impulse.setSample (1, 0, 1.0f);
+
+        juce::dsp::AudioBlock<float> block (impulse);
+        engine.process (block);
+
+        REQUIRE (TestHelpers::allSamplesFinite (impulse));
+        return impulse;
+    };
+
+    // Reference: IR A goes straight to its final onset (10) before IR B is
+    // ever loaded - IR B's alignment here can never be stale.
+    const auto expected = renderIrBOnly ([&] (CabConvolutionEngine& engine, const juce::dsp::ProcessSpec& spec)
+    {
+        engine.setImpulseResponse (makeTransientAt (10), testSampleRate);
+        engine.prepare (spec);
+        engine.setImpulseResponseB (makeTransientAt (30), testSampleRate);
+        engine.prepare (spec);
+    });
+
+    // Actual: IR A first loaded with onset 0 (so IR B aligns against that),
+    // then reloaded with onset 10 - the sequence #13 describes.
+    const auto actual = renderIrBOnly ([&] (CabConvolutionEngine& engine, const juce::dsp::ProcessSpec& spec)
+    {
+        engine.setImpulseResponse (makeTransientAt (0), testSampleRate);
+        engine.prepare (spec);
+        engine.setImpulseResponseB (makeTransientAt (30), testSampleRate);
+        engine.prepare (spec);
+        engine.setImpulseResponse (makeTransientAt (10), testSampleRate);
+        engine.prepare (spec);
+    });
+
+    for (int channel = 0; channel < expected.getNumChannels(); ++channel)
+    {
+        const auto* expectedData = expected.getReadPointer (channel);
+        const auto* actualData = actual.getReadPointer (channel);
+
+        float maxResidual = 0.0f;
+
+        for (int i = 0; i < totalSamples; ++i)
+            maxResidual = std::max (maxResidual, std::abs (actualData[i] - expectedData[i]));
+
+        CHECK (maxResidual < nullTestTolerance);
+    }
+}
+
 TEST_CASE ("Distance at 0% (default) is a bit-exact passthrough", "[dsp][engine][distance]")
 {
     CabConvolutionEngine engine;
